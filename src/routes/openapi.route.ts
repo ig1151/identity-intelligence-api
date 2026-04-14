@@ -37,13 +37,23 @@ const docsHtml = `<!DOCTYPE html>
     email: "john@stripe.com",
     phone: "+14155552671",
     ip: "8.8.8.8",
-    domain: "stripe.com"
+    use_case: "signup"
   })
 });
 const { recommendation, risk_score, lead_score } = await res.json();
 if (recommendation === "block") rejectUser();
 else if (recommendation === "call_now") prioritizeLead();
 else if (recommendation === "verify") requireOTP();</pre>
+
+  <h2>Use case presets</h2>
+  <table>
+    <tr><th>Use case</th><th>Strictness</th><th>Best for</th><th>Block threshold</th></tr>
+    <tr><td>signup</td><td>Medium</td><td>New user registration</td><td>Score &gt; 60</td></tr>
+    <tr><td>login</td><td>Medium-low</td><td>Returning user login</td><td>Score &gt; 70</td></tr>
+    <tr><td>checkout</td><td>High</td><td>Payment processing</td><td>Score &gt; 50</td></tr>
+    <tr><td>lead</td><td>Low</td><td>CRM lead qualification</td><td>Score &gt; 75</td></tr>
+    <tr><td>kyc</td><td>Very high</td><td>Identity verification</td><td>Score &gt; 40</td></tr>
+  </table>
 
   <h2>Modes</h2>
   <table>
@@ -59,14 +69,14 @@ else if (recommendation === "verify") requireOTP();</pre>
     <div class="desc">Analyze a single identity — pass any combination of email, phone, IP, domain</div>
     <pre>curl -X POST https://identity-intelligence-api.onrender.com/v1/analyze \\
   -H "Content-Type: application/json" \\
-  -d '{"email": "john@stripe.com", "ip": "8.8.8.8", "domain": "stripe.com"}'</pre>
+  -d '{"email": "john@stripe.com", "ip": "8.8.8.8", "use_case": "signup"}'</pre>
   </div>
   <div class="endpoint">
     <div><span class="badge post">POST</span><span class="path">/v1/analyze/batch</span></div>
     <div class="desc">Analyze up to 20 identities in one request</div>
     <pre>curl -X POST https://identity-intelligence-api.onrender.com/v1/analyze/batch \\
   -H "Content-Type: application/json" \\
-  -d '{"leads": [{"email": "a@company.com"}, {"email": "b@gmail.com"}]}'</pre>
+  -d '{"leads": [{"email": "a@company.com", "use_case": "signup"}, {"email": "b@gmail.com"}]}'</pre>
   </div>
 
   <h2>Recommendation values</h2>
@@ -82,10 +92,11 @@ else if (recommendation === "verify") requireOTP();</pre>
   <h2>How scoring works</h2>
   <table>
     <tr><th>Signal</th><th>Raises risk score</th><th>Raises lead score</th></tr>
-    <tr><td>Email</td><td>Disposable, no MX, invalid</td><td>Business email, valid MX</td></tr>
-    <tr><td>Phone</td><td>VoIP, fake digits, invalid</td><td>Valid direct number</td></tr>
-    <tr><td>IP</td><td>Tor, proxy, VPN, hosting</td><td>Clean residential IP</td></tr>
-    <tr><td>Company</td><td>No website, consumer brand</td><td>B2B, enterprise, active site</td></tr>
+    <tr><td>Email</td><td>Disposable (+45), no MX (+20), invalid (+40), role-based (+10)</td><td>Business email + MX (+25)</td></tr>
+    <tr><td>Phone</td><td>Fake digits (+40), VoIP (+35), invalid (+40)</td><td>Valid direct number (+15)</td></tr>
+    <tr><td>IP</td><td>Tor (+90), proxy (+70), VPN (+50), hosting (+25)</td><td>Clean residential IP</td></tr>
+    <tr><td>Company</td><td>No website, consumer brand</td><td>B2B (+15), enterprise (+20), website (+10)</td></tr>
+    <tr><td>Correlation</td><td>3+ high risk signals (+15), VPN+disposable (+20)</td><td>Risk &lt; 20 (+10)</td></tr>
   </table>
 
   <h2>OpenAPI Spec</h2>
@@ -103,13 +114,44 @@ openapiRouter.get('/', (_req: Request, res: Response) => {
     paths: {
       '/v1/health': { get: { summary: 'Health check', operationId: 'getHealth', responses: { '200': { description: 'OK' } } } },
       '/v1/analyze': {
-        post: { summary: 'Analyze identity', operationId: 'analyzePost', requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/AnalyzeRequest' }, examples: { full: { summary: 'Full analysis', value: { email: 'john@stripe.com', phone: '+14155552671', ip: '8.8.8.8', domain: 'stripe.com' } }, risk_only: { summary: 'Risk only', value: { email: 'user@gmail.com', ip: '8.8.8.8', mode: 'risk' } }, lead_only: { summary: 'Lead only', value: { email: 'ceo@startup.com', domain: 'startup.com', mode: 'lead' } } } } } }, responses: { '200': { description: 'Analysis result' }, '422': { description: 'Validation error' } } },
+        post: {
+          summary: 'Analyze identity',
+          operationId: 'analyzePost',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/AnalyzeRequest' },
+                examples: {
+                  signup: { summary: 'Signup fraud check', value: { email: 'user@gmail.com', phone: '+14155552671', ip: '8.8.8.8', use_case: 'signup' } },
+                  checkout: { summary: 'Checkout protection', value: { email: 'user@company.com', ip: '8.8.8.8', use_case: 'checkout' } },
+                  lead: { summary: 'Lead qualification', value: { email: 'ceo@startup.com', domain: 'startup.com', use_case: 'lead', mode: 'lead' } },
+                  kyc: { summary: 'KYC pre-screening', value: { email: 'user@gmail.com', phone: '+14155552671', ip: '8.8.8.8', use_case: 'kyc' } },
+                },
+              },
+            },
+          },
+          responses: { '200': { description: 'Analysis result' }, '422': { description: 'Validation error' } },
+        },
       },
       '/v1/analyze/batch': { post: { summary: 'Analyze up to 20 identities', operationId: 'analyzeBatch', requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/BatchRequest' } } } }, responses: { '200': { description: 'Batch results' } } } },
     },
     components: {
       schemas: {
-        AnalyzeRequest: { type: 'object', properties: { email: { type: 'string' }, phone: { type: 'string' }, ip: { type: 'string' }, domain: { type: 'string' }, company_name: { type: 'string' }, country_code: { type: 'string' }, mode: { type: 'string', enum: ['risk', 'lead', 'full'], default: 'full' } }, minProperties: 1 },
+        AnalyzeRequest: {
+          type: 'object',
+          properties: {
+            email: { type: 'string', example: 'john@stripe.com' },
+            phone: { type: 'string', example: '+14155552671' },
+            ip: { type: 'string', example: '8.8.8.8' },
+            domain: { type: 'string', example: 'stripe.com' },
+            company_name: { type: 'string', example: 'Stripe' },
+            country_code: { type: 'string', example: 'US' },
+            mode: { type: 'string', enum: ['risk', 'lead', 'full'], default: 'full' },
+            use_case: { type: 'string', enum: ['signup', 'login', 'checkout', 'lead', 'kyc'], default: 'signup' },
+          },
+          minProperties: 1,
+        },
         BatchRequest: { type: 'object', required: ['leads'], properties: { leads: { type: 'array', items: { $ref: '#/components/schemas/AnalyzeRequest' }, minItems: 1, maxItems: 20 } } },
       },
     },
