@@ -6,17 +6,27 @@ import { analyzeEmail } from '../utils/email.utils';
 import { analyzePhone } from '../utils/phone.utils';
 import { analyzeIP } from '../utils/ip.utils';
 import { scrapeWebsite } from '../utils/scraper';
-import type { AnalyzeRequest, AnalyzeResponse, RiskLevel, LeadQuality, Recommendation, CompanySize } from '../types/index';
+import type { AnalyzeRequest, AnalyzeResponse, RiskLevel, LeadQuality, Recommendation, CompanySize, UseCase } from '../types/index';
 
 const client = new Anthropic({ apiKey: config.anthropic.apiKey });
 
 function getRiskLevel(score: number): RiskLevel { return score >= 80 ? 'critical' : score >= 50 ? 'high' : score >= 20 ? 'medium' : 'low'; }
 function getLeadQuality(score: number): LeadQuality { return score >= 80 ? 'excellent' : score >= 60 ? 'good' : score >= 40 ? 'fair' : 'poor'; }
 
-function getRecommendation(riskScore: number, leadScore: number, isB2b: boolean): Recommendation {
-  if (riskScore >= 70) return 'block';
-  if (riskScore >= 40) return 'verify';
-  if (leadScore >= 75 && isB2b) return 'call_now';
+// Use case thresholds — different use cases have different risk tolerances
+const USE_CASE_THRESHOLDS: Record<UseCase, { blockAt: number; verifyAt: number; callAt: number }> = {
+  signup:   { blockAt: 60, verifyAt: 30, callAt: 70 },
+  login:    { blockAt: 70, verifyAt: 40, callAt: 75 },
+  checkout: { blockAt: 50, verifyAt: 25, callAt: 70 },
+  lead:     { blockAt: 75, verifyAt: 40, callAt: 65 },
+  kyc:      { blockAt: 40, verifyAt: 20, callAt: 80 },
+};
+
+function getRecommendation(riskScore: number, leadScore: number, isB2b: boolean, useCase: UseCase): Recommendation {
+  const t = USE_CASE_THRESHOLDS[useCase];
+  if (riskScore >= t.blockAt) return 'block';
+  if (riskScore >= t.verifyAt) return 'verify';
+  if (leadScore >= t.callAt && isB2b) return 'call_now';
   if (leadScore >= 50) return 'nurture';
   return 'discard';
 }
@@ -34,7 +44,7 @@ interface RiskFactors {
   isRoleBased: boolean;
 }
 
-function calculateWeightedRiskScore(factors: RiskFactors): number {
+function calculateWeightedRiskScore(factors: RiskFactors, useCase: UseCase): number {
   let score = 0;
 
   // Individual signal weights
@@ -49,12 +59,26 @@ function calculateWeightedRiskScore(factors: RiskFactors): number {
   if (factors.noMxRecords) score += 20;
   if (factors.isRoleBased) score += 10;
 
-  // Correlation bonuses — multiple signals together are worse
+  // Correlation bonuses
   const highRiskCount = [factors.isTor, factors.isProxy, factors.isVpn, factors.isDisposableEmail, factors.isFakePhone].filter(Boolean).length;
   if (highRiskCount >= 3) score += 15;
   if (factors.isDisposableEmail && factors.isVoip) score += 20;
   if (factors.isVpn && factors.isDisposableEmail) score += 20;
   if (factors.isTor) score = Math.max(score, 95);
+
+  // Use case multipliers — stricter for checkout and kyc
+  if (useCase === 'checkout' || useCase === 'kyc') {
+    if (factors.isHosting) score += 10;
+    if (factors.isVoip) score += 10;
+  }
+  if (useCase === 'login') {
+    if (factors.isVpn) score += 15;
+    if (factors.isTor) score += 5;
+  }
+  if (useCase === 'signup') {
+    if (factors.isDisposableEmail) score += 10;
+    if (factors.isFakePhone) score += 10;
+  }
 
   return Math.min(100, score);
 }
@@ -72,18 +96,14 @@ interface LeadFactors {
 
 function calculateWeightedLeadScore(base: number, factors: LeadFactors): number {
   let score = base;
-
   if (factors.isBusinessEmail && factors.validMx) score += 25;
   if (factors.validPhone && !factors.isVoip) score += 15;
   if (factors.isEnterprise) score += 20;
   if (factors.isB2b) score += 15;
   if (factors.hasWebsite) score += 10;
   if (factors.riskScore < 20) score += 10;
-
-  // Risk penalty
   if (factors.riskScore >= 70) score -= 40;
   else if (factors.riskScore >= 40) score -= 20;
-
   return Math.min(100, Math.max(0, score));
 }
 
@@ -91,10 +111,11 @@ export async function analyzeIdentity(req: AnalyzeRequest): Promise<AnalyzeRespo
   const id = `intel_${uuidv4().replace(/-/g, '').slice(0, 12)}`;
   const t0 = Date.now();
   const mode = req.mode ?? 'full';
+  const useCase = req.use_case ?? 'signup';
   const checksPerformed: string[] = [];
   const signals: AnalyzeResponse['signals'] = [];
 
-  logger.info({ id, mode, email: req.email, domain: req.domain }, 'Starting identity analysis');
+  logger.info({ id, mode, useCase, email: req.email, domain: req.domain }, 'Starting identity analysis');
 
   let emailData, phoneData, ipData;
   let companyDomain = req.domain ?? '';
@@ -129,7 +150,6 @@ export async function analyzeIdentity(req: AnalyzeRequest): Promise<AnalyzeRespo
     if (ipData.is_hosting) signals.push({ signal: 'Datacenter IP detected', severity: 'medium', source: 'ip' });
   }
 
-  // Weighted risk score
   const riskFactors: RiskFactors = {
     isTor: ipData?.is_tor ?? false,
     isProxy: ipData?.is_proxy ?? false,
@@ -144,9 +164,8 @@ export async function analyzeIdentity(req: AnalyzeRequest): Promise<AnalyzeRespo
   };
 
   const hasAnyCheck = req.email || req.phone || req.ip;
-  const riskScore = hasAnyCheck ? calculateWeightedRiskScore(riskFactors) : 0;
+  const riskScore = hasAnyCheck ? calculateWeightedRiskScore(riskFactors, useCase) : 0;
 
-  // Company enrichment
   let companyData = undefined;
   let baseLeadScore = 50;
   let isB2b = emailData?.is_business ?? false;
@@ -178,12 +197,7 @@ Return ONLY valid JSON:
       const response = await client.messages.create({ model: config.anthropic.model, max_tokens: 512, messages: [{ role: 'user', content: prompt }] });
       const raw = response.content.find(b => b.type === 'text')?.text ?? '{}';
       const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
-      companyData = {
-        name: parsed.name, domain: companyDomain, description: parsed.description,
-        industry: parsed.industry, company_size: (parsed.company_size ?? 'unknown') as CompanySize,
-        is_b2b: parsed.is_b2b ?? isB2b, has_website: parsed.has_website ?? !!companyDomain,
-        technologies: parsed.technologies ?? [],
-      };
+      companyData = { name: parsed.name, domain: companyDomain, description: parsed.description, industry: parsed.industry, company_size: (parsed.company_size ?? 'unknown') as CompanySize, is_b2b: parsed.is_b2b ?? isB2b, has_website: parsed.has_website ?? !!companyDomain, technologies: parsed.technologies ?? [] };
       isB2b = parsed.is_b2b ?? isB2b;
       isEnterprise = parsed.company_size === 'enterprise' || parsed.company_size === 'large';
       hasWebsite = parsed.has_website ?? !!companyDomain;
@@ -193,7 +207,6 @@ Return ONLY valid JSON:
     } catch (err) { logger.warn({ id, err }, 'Company enrichment failed'); }
   }
 
-  // Weighted lead score
   const leadFactors: LeadFactors = {
     isBusinessEmail: emailData?.is_business ?? false,
     validMx: emailData?.mx_found ?? false,
@@ -208,14 +221,15 @@ Return ONLY valid JSON:
   const leadScore = calculateWeightedLeadScore(baseLeadScore, leadFactors);
   const riskLevel = getRiskLevel(riskScore);
   const leadQuality = getLeadQuality(leadScore);
-  const recommendation = getRecommendation(riskScore, leadScore, isB2b);
+  const recommendation = getRecommendation(riskScore, leadScore, isB2b, useCase);
   const likelyToConvert = leadScore >= 60 && riskScore < 50;
   const conversionConfidence = parseFloat((leadScore / 100).toFixed(2));
 
-  logger.info({ id, riskScore, leadScore, recommendation }, 'Analysis complete');
+  logger.info({ id, riskScore, leadScore, recommendation, useCase }, 'Analysis complete');
 
   return {
-    id, recommendation, risk_score: riskScore, risk_level: riskLevel,
+    id, use_case: useCase, recommendation,
+    risk_score: riskScore, risk_level: riskLevel,
     lead_score: leadScore, lead_quality: leadQuality,
     is_b2b: isB2b, likely_to_convert: likelyToConvert, conversion_confidence: conversionConfidence,
     signals,

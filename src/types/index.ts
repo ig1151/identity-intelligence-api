@@ -1,6 +1,7 @@
 export type RiskLevel = 'low' | 'medium' | 'high' | 'critical';
 export type LeadQuality = 'excellent' | 'good' | 'fair' | 'poor';
 export type Recommendation = 'call_now' | 'nurture' | 'verify' | 'discard' | 'block';
+export type UseCase = 'signup' | 'login' | 'checkout' | 'lead' | 'kyc';
 export type CompanySize = 'solo' | 'small' | 'medium' | 'large' | 'enterprise' | 'unknown';
 
 export interface AnalyzeRequest {
@@ -11,6 +12,7 @@ export interface AnalyzeRequest {
   company_name?: string;
   country_code?: string;
   mode?: 'risk' | 'lead' | 'full';
+  use_case?: UseCase;
 }
 
 export interface EmailIntelligence {
@@ -56,6 +58,7 @@ export interface CompanyIntelligence {
 
 export interface AnalyzeResponse {
   id: string;
+  use_case: string;
   recommendation: Recommendation;
   risk_score: number;
   risk_level: RiskLevel;
