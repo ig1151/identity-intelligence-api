@@ -1,6 +1,4 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { v4 as uuidv4 } from 'uuid';
-import { config } from '../utils/config';
 import { logger } from '../utils/logger';
 import { analyzeEmail } from '../utils/email.utils';
 import { analyzePhone } from '../utils/phone.utils';
@@ -8,12 +6,12 @@ import { analyzeIP } from '../utils/ip.utils';
 import { scrapeWebsite } from '../utils/scraper';
 import type { AnalyzeRequest, AnalyzeResponse, RiskLevel, LeadQuality, Recommendation, CompanySize, UseCase } from '../types/index';
 
-const client = new Anthropic({ apiKey: config.anthropic.apiKey });
+const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const MODEL = 'anthropic/claude-sonnet-4-5';
 
 function getRiskLevel(score: number): RiskLevel { return score >= 80 ? 'critical' : score >= 50 ? 'high' : score >= 20 ? 'medium' : 'low'; }
 function getLeadQuality(score: number): LeadQuality { return score >= 80 ? 'excellent' : score >= 60 ? 'good' : score >= 40 ? 'fair' : 'poor'; }
 
-// Use case thresholds — different use cases have different risk tolerances
 const USE_CASE_THRESHOLDS: Record<UseCase, { blockAt: number; verifyAt: number; callAt: number }> = {
   signup:   { blockAt: 60, verifyAt: 30, callAt: 70 },
   login:    { blockAt: 70, verifyAt: 40, callAt: 75 },
@@ -32,22 +30,13 @@ function getRecommendation(riskScore: number, leadScore: number, isB2b: boolean,
 }
 
 interface RiskFactors {
-  isTor: boolean;
-  isProxy: boolean;
-  isVpn: boolean;
-  isHosting: boolean;
-  isDisposableEmail: boolean;
-  isInvalidEmail: boolean;
-  isFakePhone: boolean;
-  isVoip: boolean;
-  noMxRecords: boolean;
-  isRoleBased: boolean;
+  isTor: boolean; isProxy: boolean; isVpn: boolean; isHosting: boolean;
+  isDisposableEmail: boolean; isInvalidEmail: boolean; isFakePhone: boolean;
+  isVoip: boolean; noMxRecords: boolean; isRoleBased: boolean;
 }
 
 function calculateWeightedRiskScore(factors: RiskFactors, useCase: UseCase): number {
   let score = 0;
-
-  // Individual signal weights
   if (factors.isTor) score += 90;
   else if (factors.isProxy) score += 70;
   else if (factors.isVpn) score += 50;
@@ -58,40 +47,20 @@ function calculateWeightedRiskScore(factors: RiskFactors, useCase: UseCase): num
   if (factors.isHosting) score += 25;
   if (factors.noMxRecords) score += 20;
   if (factors.isRoleBased) score += 10;
-
-  // Correlation bonuses
   const highRiskCount = [factors.isTor, factors.isProxy, factors.isVpn, factors.isDisposableEmail, factors.isFakePhone].filter(Boolean).length;
   if (highRiskCount >= 3) score += 15;
   if (factors.isDisposableEmail && factors.isVoip) score += 20;
   if (factors.isVpn && factors.isDisposableEmail) score += 20;
   if (factors.isTor) score = Math.max(score, 95);
-
-  // Use case multipliers — stricter for checkout and kyc
-  if (useCase === 'checkout' || useCase === 'kyc') {
-    if (factors.isHosting) score += 10;
-    if (factors.isVoip) score += 10;
-  }
-  if (useCase === 'login') {
-    if (factors.isVpn) score += 15;
-    if (factors.isTor) score += 5;
-  }
-  if (useCase === 'signup') {
-    if (factors.isDisposableEmail) score += 10;
-    if (factors.isFakePhone) score += 10;
-  }
-
+  if (useCase === 'checkout' || useCase === 'kyc') { if (factors.isHosting) score += 10; if (factors.isVoip) score += 10; }
+  if (useCase === 'login') { if (factors.isVpn) score += 15; if (factors.isTor) score += 5; }
+  if (useCase === 'signup') { if (factors.isDisposableEmail) score += 10; if (factors.isFakePhone) score += 10; }
   return Math.min(100, score);
 }
 
 interface LeadFactors {
-  isBusinessEmail: boolean;
-  validMx: boolean;
-  validPhone: boolean;
-  isVoip: boolean;
-  isEnterprise: boolean;
-  isB2b: boolean;
-  hasWebsite: boolean;
-  riskScore: number;
+  isBusinessEmail: boolean; validMx: boolean; validPhone: boolean; isVoip: boolean;
+  isEnterprise: boolean; isB2b: boolean; hasWebsite: boolean; riskScore: number;
 }
 
 function calculateWeightedLeadScore(base: number, factors: LeadFactors): number {
@@ -114,6 +83,8 @@ export async function analyzeIdentity(req: AnalyzeRequest): Promise<AnalyzeRespo
   const useCase = req.use_case ?? 'signup';
   const checksPerformed: string[] = [];
   const signals: AnalyzeResponse['signals'] = [];
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) throw new Error('OPENROUTER_API_KEY not set');
 
   logger.info({ id, mode, useCase, email: req.email, domain: req.domain }, 'Starting identity analysis');
 
@@ -151,16 +122,11 @@ export async function analyzeIdentity(req: AnalyzeRequest): Promise<AnalyzeRespo
   }
 
   const riskFactors: RiskFactors = {
-    isTor: ipData?.is_tor ?? false,
-    isProxy: ipData?.is_proxy ?? false,
-    isVpn: ipData?.is_vpn ?? false,
-    isHosting: ipData?.is_hosting ?? false,
-    isDisposableEmail: emailData?.disposable ?? false,
-    isInvalidEmail: emailData ? !emailData.valid : false,
-    isFakePhone: phoneData?.is_likely_fake ?? false,
-    isVoip: phoneData?.is_voip ?? false,
-    noMxRecords: emailData ? !emailData.mx_found : false,
-    isRoleBased: emailData?.role_based ?? false,
+    isTor: ipData?.is_tor ?? false, isProxy: ipData?.is_proxy ?? false,
+    isVpn: ipData?.is_vpn ?? false, isHosting: ipData?.is_hosting ?? false,
+    isDisposableEmail: emailData?.disposable ?? false, isInvalidEmail: emailData ? !emailData.valid : false,
+    isFakePhone: phoneData?.is_likely_fake ?? false, isVoip: phoneData?.is_voip ?? false,
+    noMxRecords: emailData ? !emailData.mx_found : false, isRoleBased: emailData?.role_based ?? false,
   };
 
   const hasAnyCheck = req.email || req.phone || req.ip;
@@ -194,8 +160,16 @@ Return ONLY valid JSON:
   "positive_signals": ["<signal>"],
   "negative_signals": ["<signal>"]
 }`;
-      const response = await client.messages.create({ model: config.anthropic.model, max_tokens: 512, messages: [{ role: 'user', content: prompt }] });
-      const raw = response.content.find(b => b.type === 'text')?.text ?? '{}';
+
+      const response = await fetch(OPENROUTER_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+        body: JSON.stringify({ model: MODEL, max_tokens: 512, messages: [{ role: 'user', content: prompt }], response_format: { type: 'json_object' } }),
+      });
+
+      if (!response.ok) throw new Error(`OpenRouter error: ${response.status}`);
+      const data = await response.json() as { choices: { message: { content: string } }[] };
+      const raw = data.choices[0].message.content ?? '{}';
       const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
       companyData = { name: parsed.name, domain: companyDomain, description: parsed.description, industry: parsed.industry, company_size: (parsed.company_size ?? 'unknown') as CompanySize, is_b2b: parsed.is_b2b ?? isB2b, has_website: parsed.has_website ?? !!companyDomain, technologies: parsed.technologies ?? [] };
       isB2b = parsed.is_b2b ?? isB2b;
@@ -208,14 +182,9 @@ Return ONLY valid JSON:
   }
 
   const leadFactors: LeadFactors = {
-    isBusinessEmail: emailData?.is_business ?? false,
-    validMx: emailData?.mx_found ?? false,
-    validPhone: phoneData?.valid ?? false,
-    isVoip: phoneData?.is_voip ?? false,
-    isEnterprise,
-    isB2b,
-    hasWebsite,
-    riskScore,
+    isBusinessEmail: emailData?.is_business ?? false, validMx: emailData?.mx_found ?? false,
+    validPhone: phoneData?.valid ?? false, isVoip: phoneData?.is_voip ?? false,
+    isEnterprise, isB2b, hasWebsite, riskScore,
   };
 
   const leadScore = calculateWeightedLeadScore(baseLeadScore, leadFactors);
